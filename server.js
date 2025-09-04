@@ -1,10 +1,10 @@
-      //server.js
 const express = require('express');
 const mongoose = require('mongoose');
 const dotenv = require('dotenv');
 const cors = require('cors');
 const morgan = require('morgan');
 const connectDB = require('./config/db');
+const path = require('path');
 
 // Load environment variables
 dotenv.config();
@@ -13,10 +13,27 @@ dotenv.config();
 const app = express();
 
 // Middleware
+const allowedOrigins = [
+  'http://localhost:3000',                     // Development frontend
+  process.env.FRONTEND_URL,                     // Production frontend (set in environment)
+  'https://employee-backend-mcg5.onrender.com'  // Backend domain (for API calls)
+].filter(Boolean); // Remove any undefined/empty values
+
 app.use(cors({
-  origin: ['https://employee-backend-mcg5.onrender.com', 'http://localhost:3000'],
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+    
+    // Check if origin is in allowed list
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`Origin ${origin} not allowed by CORS`));
+    }
+  },
   credentials: true
 }));
+
 app.use(express.json());
 app.use(morgan('dev'));
 
@@ -29,10 +46,8 @@ app.get('/', (req, res) => {
   });
 });
 
-
 // ✅ Connect Database
 connectDB();
-
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
