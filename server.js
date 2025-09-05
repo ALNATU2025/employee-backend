@@ -11,6 +11,9 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const multer = require('multer');
 const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const xss = require('xss-clean');
+const hpp = require('hpp');
 
 // Load environment variables
 dotenv.config();
@@ -18,19 +21,21 @@ dotenv.config();
 // Initialize Express app
 const app = express();
 
+// Security middleware
+app.use(helmet());
+app.use(xss());
+app.use(hpp());
+
 // Middleware
 const allowedOrigins = [
-  'http://localhost:3000',                     // Development frontend
-  process.env.FRONTEND_URL,                     // Production frontend (set in environment)
-  'https://employee-backend-mcg5.onrender.com'  // Backend domain (for API calls)
-].filter(Boolean); // Remove any undefined/empty values
+  'http://localhost:3000',
+  process.env.FRONTEND_URL,
+  'https://employee-backend-mcg5.onrender.com'
+].filter(Boolean);
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, Postman, etc.)
     if (!origin) return callback(null, true);
-    
-    // Check if origin is in allowed list
     if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
@@ -40,10 +45,31 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '10kb' }));
 app.use(morgan('dev'));
 
-// Health check endpoint (required by Render)
+// Rate limiting
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: {
+    success: false,
+    error: 'Too many attempts',
+    message: 'Too many authentication attempts, please try again later'
+  }
+});
+
+const userManagementLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: {
+    success: false,
+    error: 'Too many requests',
+    message: 'Too many user management attempts, please try again later'
+  }
+});
+
+// Health check endpoint
 app.get('/', (req, res) => {
   res.status(200).json({ 
     message: 'Server is running',
@@ -54,23 +80,19 @@ app.get('/', (req, res) => {
 
 // Database connection
 const connectDB = async () => {
-  // Set mongoose options to suppress deprecation warnings
   mongoose.set('strictQuery', false);
   
   try {
     const conn = await mongoose.connect(process.env.MONGO_URI, {
-      // Modern connection options (Mongoose 8+)
-      maxPoolSize: 10, // Maintain up to 10 socket connections
-      serverSelectionTimeoutMS: 5000, // Keep trying to send operations for 5 seconds
-      socketTimeoutMS: 45000, // Close sockets after 45 seconds of inactivity
-      family: 4, // Use IPv4, skip trying IPv6
-      // Add these for better connection handling
+      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+      family: 4,
       retryWrites: true,
       w: 'majority'
     });
     console.log(`MongoDB Connected: ${conn.connection.host}`);
     
-    // Connection event listeners for better monitoring
     mongoose.connection.on('connected', () => {
       console.log('Mongoose connected to DB');
     });
@@ -79,10 +101,9 @@ const connectDB = async () => {
     });
     mongoose.connection.on('disconnected', () => {
       console.log('Mongoose disconnected');
-      // Attempt to reconnect after 5 seconds
       setTimeout(connectDB, 5000);
     });
-    // Handle application termination
+    
     process.on('SIGINT', async () => {
       await mongoose.connection.close();
       console.log('MongoDB connection closed through app termination');
@@ -94,14 +115,10 @@ const connectDB = async () => {
       stack: err.stack,
       name: err.name
     });
-    
-    // Retry connection after 5 seconds
-    console.log('Retrying connection in 5 seconds...');
     setTimeout(connectDB, 5000);
   }
 };
 
-// Connect Database
 connectDB();
 
 // User Schema
@@ -166,17 +183,8 @@ const UserSchema = new mongoose.Schema({
   toObject: { virtuals: true }
 });
 
-// Virtual for full name (if needed in future)
-UserSchema.virtual('fullName').get(function() {
-  return this.name;
-});
-
-// Encrypt password using bcrypt
 UserSchema.pre('save', async function(next) {
-  // Only hash password if it's modified
-  if (!this.isModified('password')) {
-    return next();
-  }
+  if (!this.isModified('password')) return next();
   
   try {
     const salt = await bcrypt.genSalt(10);
@@ -187,12 +195,10 @@ UserSchema.pre('save', async function(next) {
   }
 });
 
-// Match user entered password to hashed password in database
 UserSchema.methods.matchPassword = async function(enteredPassword) {
   return await bcrypt.compare(enteredPassword, this.password);
 };
 
-// Generate JWT Token
 UserSchema.methods.getSignedJwtToken = function() {
   return jwt.sign(
     { 
@@ -207,33 +213,26 @@ UserSchema.methods.getSignedJwtToken = function() {
   );
 };
 
-// Generate and hash password token
 UserSchema.methods.getResetPasswordToken = function() {
-  // Generate token
   const resetToken = crypto.randomBytes(20).toString('hex');
-  // Hash token and set to resetPasswordToken field
   this.resetPasswordToken = crypto
     .createHash('sha256')
     .update(resetToken)
     .digest('hex');
-  // Set expire
-  this.resetPasswordExpire = Date.now() + 10 * 60 * 1000; // 10 minutes
+  this.resetPasswordExpire = Date.now() + 10 * 60 * 1000;
   return resetToken;
 };
 
-// Method to update login information
 UserSchema.methods.updateLoginInfo = function() {
   this.lastLogin = new Date();
   this.loginCount += 1;
   return this.save();
 };
 
-// Static method to find active users
 UserSchema.statics.findActive = function() {
   return this.find({ isActive: true });
 };
 
-// Create indexes for better query performance
 UserSchema.index({ role: 1 });
 UserSchema.index({ department: 1 });
 UserSchema.index({ isActive: 1 });
@@ -288,7 +287,6 @@ const ReportSchema = new mongoose.Schema({
     type: Date,
     validate: {
       validator: function(value) {
-        // Due date must be in the future
         return !value || value > Date.now();
       },
       message: 'Due date must be in the future'
@@ -355,12 +353,10 @@ const ReportSchema = new mongoose.Schema({
   toObject: { virtuals: true }
 });
 
-// Virtual for report age (in days)
 ReportSchema.virtual('ageInDays').get(function() {
   return Math.floor((Date.now() - this.createdAt) / (1000 * 60 * 60 * 24));
 });
 
-// Virtual for due status
 ReportSchema.virtual('dueStatus').get(function() {
   if (!this.dueDate) return 'not_set';
   const now = new Date();
@@ -374,7 +370,6 @@ ReportSchema.virtual('dueStatus').get(function() {
   return 'on_time';
 });
 
-// Pre-save hook to update timestamps
 ReportSchema.pre('save', function(next) {
   if (this.isModified('status') && this.status === 'submitted') {
     this.submittedAt = new Date();
@@ -385,12 +380,10 @@ ReportSchema.pre('save', function(next) {
   next();
 });
 
-// Static method to find reports by status
 ReportSchema.statics.findByStatus = function(status) {
   return this.find({ status, isArchived: false });
 };
 
-// Static method to find overdue reports
 ReportSchema.statics.findOverdue = function() {
   return this.find({
     dueDate: { $lt: Date.now() },
@@ -399,13 +392,11 @@ ReportSchema.statics.findOverdue = function() {
   });
 };
 
-// Instance method to add attachment
 ReportSchema.methods.addAttachment = function(attachment) {
   this.attachments.push(attachment);
   return this.save();
 };
 
-// Instance method to remove attachment
 ReportSchema.methods.removeAttachment = function(attachmentId) {
   this.attachments = this.attachments.filter(
     att => att._id.toString() !== attachmentId.toString()
@@ -413,7 +404,6 @@ ReportSchema.methods.removeAttachment = function(attachmentId) {
   return this.save();
 };
 
-// Create compound indexes for better query performance
 ReportSchema.index({ employeeId: 1, status: 1 });
 ReportSchema.index({ department: 1, status: 1 });
 ReportSchema.index({ category: 1, priority: 1 });
@@ -460,13 +450,13 @@ const ComplaintSchema = new mongoose.Schema({
   status: {
     type: String,
     enum: [
-      'pending',           // Just submitted
-      'under_review',      // Being investigated
-      'investigation',     // Detailed investigation
-      'action_required',   // Solution identified
-      'resolved',          // Fully resolved
-      'dismissed',         // Deemed invalid
-      'escalated'          // Sent to higher authority
+      'pending',           
+      'under_review',      
+      'investigation',     
+      'action_required',   
+      'resolved',          
+      'dismissed',         
+      'escalated'          
     ],
     default: 'pending',
     index: true
@@ -576,24 +566,20 @@ const ComplaintSchema = new mongoose.Schema({
   toObject: { virtuals: true }
 });
 
-// Virtual for complaint age (in days)
 ComplaintSchema.virtual('ageInDays').get(function() {
   return Math.floor((Date.now() - this.createdAt) / (1000 * 60 * 60 * 24));
 });
 
-// Virtual for resolution time (in days)
 ComplaintSchema.virtual('resolutionTimeInDays').get(function() {
   if (!this.resolvedAt) return null;
   return Math.floor((this.resolvedAt - this.createdAt) / (1000 * 60 * 60 * 24));
 });
 
-// Virtual for time since last update
 ComplaintSchema.virtual('daysSinceLastUpdate').get(function() {
   const lastUpdate = this.updatedAt;
   return Math.floor((Date.now() - lastUpdate) / (1000 * 60 * 60 * 24));
 });
 
-// Pre-save hook to update status history
 ComplaintSchema.pre('save', function(next) {
   if (this.isModified('status')) {
     this.statusHistory.push({
@@ -602,7 +588,6 @@ ComplaintSchema.pre('save', function(next) {
       comments: this.resolutionComments || ''
     });
     
-    // Update timestamps based on status
     if (this.status === 'under_review' && !this.assignedAt) {
       this.assignedAt = new Date();
     }
@@ -613,12 +598,10 @@ ComplaintSchema.pre('save', function(next) {
   next();
 });
 
-// Static method to find complaints by status
 ComplaintSchema.statics.findByStatus = function(status) {
   return this.find({ status });
 };
 
-// Static method to find high-priority complaints
 ComplaintSchema.statics.findHighPriority = function() {
   return this.find({
     priority: { $in: ['high', 'urgent'] },
@@ -626,21 +609,18 @@ ComplaintSchema.statics.findHighPriority = function() {
   });
 };
 
-// Static method to find overdue complaints
 ComplaintSchema.statics.findOverdue = function() {
   return this.find({
     status: { $nin: ['resolved', 'dismissed'] },
-    createdAt: { $lt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } // Older than 7 days
+    createdAt: { $lt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }
   });
 };
 
-// Instance method to add attachment
 ComplaintSchema.methods.addAttachment = function(attachment) {
   this.attachments.push(attachment);
   return this.save();
 };
 
-// Instance method to update status
 ComplaintSchema.methods.updateStatus = function(status, updatedBy, comments = '') {
   this.status = status;
   this.lastUpdatedBy = updatedBy;
@@ -648,7 +628,6 @@ ComplaintSchema.methods.updateStatus = function(status, updatedBy, comments = ''
   return this.save();
 };
 
-// Create indexes for better query performance
 ComplaintSchema.index({ employeeId: 1, status: 1 });
 ComplaintSchema.index({ category: 1, priority: 1 });
 ComplaintSchema.index({ status: 1, priority: 1 });
@@ -659,24 +638,19 @@ const Complaint = mongoose.model('Complaint', ComplaintSchema);
 
 // Authentication middleware
 const auth = async function (req, res, next) {
-  // Get token from header, cookie, or authorization header
   let token;
   
-  // Check Authorization header first (Bearer token)
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     token = authHeader.split(' ')[1];
   }
-  // Check x-auth-token header
   else if (req.header('x-auth-token')) {
     token = req.header('x-auth-token');
   }
-  // Check cookie
   else if (req.cookies && req.cookies.token) {
     token = req.cookies.token;
   }
   
-  // Check if not token
   if (!token) {
     return res.status(401).json({ 
       success: false,
@@ -686,13 +660,9 @@ const auth = async function (req, res, next) {
   }
   
   try {
-    // Verify token
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
-    // Add user from payload
     req.user = await User.findById(decoded.id).select('-password');
     
-    // Check if user exists
     if (!req.user) {
       return res.status(401).json({ 
         success: false,
@@ -701,7 +671,6 @@ const auth = async function (req, res, next) {
       });
     }
     
-    // Check if user is active
     if (!req.user.isActive) {
       return res.status(401).json({ 
         success: false,
@@ -715,10 +684,9 @@ const auth = async function (req, res, next) {
     console.error('Authentication error:', {
       error: err.message,
       stack: err.stack,
-      token: token.substring(0, 10) + '...' // Log only part of token for security
+      token: token.substring(0, 10) + '...'
     });
     
-    // Handle specific JWT errors
     let errorMessage = 'Token is not valid';
     if (err.name === 'TokenExpiredError') {
       errorMessage = 'Token expired - Please login again';
@@ -762,7 +730,6 @@ const authorize = (...roles) => {
 // Configure multer for file uploads (reports)
 const reportStorage = multer.diskStorage({
   destination: function (req, file, cb) {
-    // Create uploads directory if it doesn't exist
     const fs = require('fs');
     const dir = 'uploads/reports/';
     if (!fs.existsSync(dir)) {
@@ -778,7 +745,7 @@ const reportStorage = multer.diskStorage({
 const reportUpload = multer({
   storage: reportStorage,
   limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
+    fileSize: 5 * 1024 * 1024,
   },
   fileFilter: function (req, file, cb) {
     const allowedFileTypes = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt'];
@@ -795,7 +762,6 @@ const reportUpload = multer({
 // Configure multer for file uploads (complaints)
 const complaintStorage = multer.diskStorage({
   destination: function (req, file, cb) {
-    // Create uploads directory if it doesn't exist
     const fs = require('fs');
     const dir = 'uploads/complaints/';
     if (!fs.existsSync(dir)) {
@@ -811,7 +777,7 @@ const complaintStorage = multer.diskStorage({
 const complaintUpload = multer({
   storage: complaintStorage,
   limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
+    fileSize: 5 * 1024 * 1024,
   },
   fileFilter: function (req, file, cb) {
     const allowedFileTypes = ['.pdf', '.doc', '.docx', '.jpg', '.jpeg', '.png', '.txt'];
@@ -825,36 +791,10 @@ const complaintUpload = multer({
   }
 });
 
-// Rate limiting for authentication routes
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // Limit each IP to 5 requests per windowMs
-  message: {
-    success: false,
-    error: 'Too many attempts',
-    message: 'Too many authentication attempts, please try again later'
-  }
-});
-
-// Rate limiting for user management operations
-const userManagementLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // Limit each IP to 10 requests per windowMs
-  message: {
-    success: false,
-    error: 'Too many requests',
-    message: 'Too many user management attempts, please try again later'
-  }
-});
-
 // Authentication Routes
 const authRouter = express.Router();
 
-// @route   POST api/auth/register
-// @desc    Register a user
-// @access  Public
 authRouter.post('/register', [
-  // Input validation
   check('name', 'Name is required').not().isEmpty(),
   check('name', 'Name must be less than 50 characters').isLength({ max: 50 }),
   check('email', 'Please include a valid email').isEmail(),
@@ -874,7 +814,6 @@ authRouter.post('/register', [
   const { name, email, password, role } = req.body;
   
   try {
-    // Check if user already exists
     let user = await User.findOne({ email });
     if (user) {
       return res.status(400).json({
@@ -884,7 +823,6 @@ authRouter.post('/register', [
       });
     }
     
-    // Create new user
     user = new User({
       name,
       email,
@@ -892,13 +830,10 @@ authRouter.post('/register', [
       role: role || 'employee'
     });
     
-    // Save user (password will be hashed by pre-save hook)
     await user.save();
     
-    // Generate JWT token
     const token = user.getSignedJwtToken();
     
-    // Return response
     res.status(201).json({
       success: true,
       token,
@@ -920,11 +855,7 @@ authRouter.post('/register', [
   }
 });
 
-// @route   POST api/auth/login
-// @desc    Authenticate user & get token
-// @access  Public
 authRouter.post('/login', [
-  // Input validation
   check('email', 'Please include a valid email').isEmail(),
   check('password', 'Password is required').exists()
 ], authLimiter, async (req, res) => {
@@ -940,7 +871,6 @@ authRouter.post('/login', [
   const { email, password } = req.body;
   
   try {
-    // Check if user exists
     const user = await User.findOne({ email }).select('+password');
     if (!user) {
       return res.status(401).json({
@@ -950,7 +880,6 @@ authRouter.post('/login', [
       });
     }
     
-    // Validate password
     const isMatch = await user.matchPassword(password);
     if (!isMatch) {
       return res.status(401).json({
@@ -960,13 +889,10 @@ authRouter.post('/login', [
       });
     }
     
-    // Update login information
     await user.updateLoginInfo();
     
-    // Generate JWT token
     const token = user.getSignedJwtToken();
     
-    // Return response
     res.json({
       success: true,
       token,
@@ -989,29 +915,9 @@ authRouter.post('/login', [
   }
 });
 
-// @route   GET api/auth/current
-// @desc    Get current logged in user
-// @access  Private
-authRouter.get('/current', async (req, res) => {
+authRouter.get('/current', auth, async (req, res) => {
   try {
-    // Get token from header
-    const token = req.header('x-auth-token') || 
-                 req.headers.authorization?.split(' ')[1] || 
-                 req.cookies?.token;
-    
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        error: 'NoToken',
-        message: 'No token, authorization denied'
-      });
-    }
-    
-    // Verify token
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
-    // Get user from database
-    const user = await User.findById(decoded.id).select('-password');
+    const user = await User.findById(req.user.id).select('-password');
     
     if (!user) {
       return res.status(401).json({
@@ -1021,7 +927,6 @@ authRouter.get('/current', async (req, res) => {
       });
     }
     
-    // Return user data
     res.json({
       success: true,
       user: {
@@ -1037,21 +942,16 @@ authRouter.get('/current', async (req, res) => {
     });
   } catch (err) {
     console.error('Get current user error:', err.message);
-    res.status(401).json({
+    res.status(500).json({
       success: false,
-      error: 'TokenError',
-      message: 'Token is not valid'
+      error: 'ServerError',
+      message: 'Server error fetching user data'
     });
   }
 });
 
-// @route   POST api/auth/logout
-// @desc    Logout user (invalidate token)
-// @access  Private
-authRouter.post('/logout', async (req, res) => {
+authRouter.post('/logout', auth, async (req, res) => {
   try {
-    // In a stateless JWT system, logout is typically handled client-side
-    // For true logout, you would need to implement token blacklisting
     res.json({
       success: true,
       message: 'User logged out successfully'
@@ -1066,9 +966,6 @@ authRouter.post('/logout', async (req, res) => {
   }
 });
 
-// @route   POST api/auth/forgot-password
-// @desc    Send password reset email
-// @access  Public
 authRouter.post('/forgot-password', [
   check('email', 'Please include a valid email').isEmail()
 ], async (req, res) => {
@@ -1087,21 +984,17 @@ authRouter.post('/forgot-password', [
     const user = await User.findOne({ email });
     
     if (!user) {
-      // Don't reveal that user doesn't exist for security
       return res.json({
         success: true,
         message: 'If an account with that email exists, a reset link has been sent'
       });
     }
     
-    // Generate reset token
     const resetToken = user.getResetPasswordToken();
     await user.save({ validateBeforeSave: false });
     
-    // Create reset URL
     const resetUrl = `${process.env.FRONTEND_URL}/reset-password/${resetToken}`;
     
-    // In a real app, you would send an email here
     console.log('Reset URL:', resetUrl);
     
     res.json({
@@ -1118,9 +1011,6 @@ authRouter.post('/forgot-password', [
   }
 });
 
-// @route   POST api/auth/reset-password/:token
-// @desc    Reset password
-// @access  Public
 authRouter.post('/reset-password/:token', [
   check('password', 'Password is required').exists(),
   check('password', 'Password must be at least 6 characters').isLength({ min: 6 })
@@ -1138,13 +1028,11 @@ authRouter.post('/reset-password/:token', [
   const { token } = req.params;
   
   try {
-    // Hash token to compare with stored token
     const resetPasswordToken = crypto
       .createHash('sha256')
       .update(token)
       .digest('hex');
     
-    // Find user by token and check if token is still valid
     const user = await User.findOne({
       resetPasswordToken,
       resetPasswordExpire: { $gt: Date.now() }
@@ -1158,7 +1046,6 @@ authRouter.post('/reset-password/:token', [
       });
     }
     
-    // Set new password
     user.password = password;
     user.resetPasswordToken = undefined;
     user.resetPasswordExpire = undefined;
@@ -1182,9 +1069,6 @@ authRouter.post('/reset-password/:token', [
 // User Routes
 const userRouter = express.Router();
 
-// @route   GET api/users
-// @desc    Get all users (Admin only) with pagination and filtering
-// @access  Private (Admin only)
 userRouter.get('/', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo'),
@@ -1193,23 +1077,19 @@ userRouter.get('/', [
   try {
     const { page = 1, limit = 10, role, department, isActive } = req.query;
     
-    // Build query
     let query = {};
     if (role) query.role = role;
     if (department) query.department = department;
     if (isActive !== undefined) query.isActive = isActive === 'true';
     
-    // Calculate pagination
     const skip = (page - 1) * limit;
     
-    // Execute query with pagination
     const users = await User.find(query)
       .select('-password -resetPasswordToken -resetPasswordExpire')
       .sort({ createdAt: -1 })
       .limit(parseInt(limit))
       .skip(skip);
     
-    // Get total count for pagination
     const total = await User.countDocuments(query);
     
     res.json({
@@ -1232,12 +1112,8 @@ userRouter.get('/', [
   }
 });
 
-// @route   GET api/users/profile
-// @desc    Get current user profile
-// @access  Private
 userRouter.get('/profile', auth, async (req, res) => {
   try {
-    // Get fresh user data from database
     const user = await User.findById(req.user.id)
       .select('-password -resetPasswordToken -resetPasswordExpire');
     
@@ -1255,9 +1131,6 @@ userRouter.get('/profile', auth, async (req, res) => {
   }
 });
 
-// @route   GET api/users/:id
-// @desc    Get single user by ID (Admin only)
-// @access  Private (Admin only)
 userRouter.get('/:id', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo')
@@ -1288,9 +1161,6 @@ userRouter.get('/:id', [
   }
 });
 
-// @route   POST api/users
-// @desc    Create new user (Admin only)
-// @access  Private (Admin only)
 userRouter.post('/', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo'),
@@ -1315,7 +1185,6 @@ userRouter.post('/', [
   try {
     const { name, email, password, role, department } = req.body;
     
-    // Check if user already exists
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return res.status(400).json({
@@ -1325,7 +1194,6 @@ userRouter.post('/', [
       });
     }
     
-    // Create new user
     const user = new User({
       name,
       email,
@@ -1358,9 +1226,6 @@ userRouter.post('/', [
   }
 });
 
-// @route   PUT api/users/:id
-// @desc    Update user by ID (Admin only)
-// @access  Private (Admin only)
 userRouter.put('/:id', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo'),
@@ -1389,7 +1254,6 @@ userRouter.put('/:id', [
       });
     }
     
-    // Update fields if provided
     const { name, email, role, department, isActive } = req.body;
     
     if (name) user.name = name;
@@ -1422,9 +1286,6 @@ userRouter.put('/:id', [
   }
 });
 
-// @route   PUT api/users/:id/password
-// @desc    Reset user password (Admin only)
-// @access  Private (Admin only)
 userRouter.put('/:id/password', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo'),
@@ -1451,7 +1312,6 @@ userRouter.put('/:id/password', [
       });
     }
     
-    // Update password
     user.password = req.body.password;
     await user.save();
     
@@ -1469,9 +1329,6 @@ userRouter.put('/:id/password', [
   }
 });
 
-// @route   PUT api/users/:id/activate
-// @desc    Activate user account (Admin only)
-// @access  Private (Admin only)
 userRouter.put('/:id/activate', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo'),
@@ -1487,7 +1344,6 @@ userRouter.put('/:id/activate', [
       });
     }
     
-    // Activate user
     user.isActive = true;
     await user.save();
     
@@ -1511,9 +1367,6 @@ userRouter.put('/:id/activate', [
   }
 });
 
-// @route   PUT api/users/:id/deactivate
-// @desc    Deactivate user account (Admin only)
-// @access  Private (Admin only)
 userRouter.put('/:id/deactivate', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo'),
@@ -1529,7 +1382,6 @@ userRouter.put('/:id/deactivate', [
       });
     }
     
-    // Deactivate user
     user.isActive = false;
     await user.save();
     
@@ -1553,9 +1405,6 @@ userRouter.put('/:id/deactivate', [
   }
 });
 
-// @route   DELETE api/users/:id
-// @desc    Soft delete user (Admin only)
-// @access  Private (Admin only)
 userRouter.delete('/:id', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo'),
@@ -1571,7 +1420,6 @@ userRouter.delete('/:id', [
       });
     }
     
-    // Soft delete - mark as inactive
     user.isActive = false;
     await user.save();
     
@@ -1592,19 +1440,15 @@ userRouter.delete('/:id', [
 // Report Routes
 const reportRouter = express.Router();
 
-// Helper function to check report access
 function checkReportAccess(user, report) {
-  // CEO can access all reports
   if (user.role === 'ceo') {
     return true;
   }
   
-  // Employees can only access their own reports
   if (user.role === 'employee') {
     return report.employeeId._id.toString() === user.id;
   }
   
-  // Executives can only access reports in their category
   const categoryMap = {
     'cto': 'technical',
     'cfo': 'financial',
@@ -1615,17 +1459,13 @@ function checkReportAccess(user, report) {
     return report.category === categoryMap[user.role];
   }
   
-  // All other roles are denied
   return false;
 }
 
-// @route   POST api/reports
-// @desc    Create a new report
-// @access  Private (Employee only)
 reportRouter.post('/', [
   auth,
   authorize('employee'),
-  reportUpload.array('attachments', 5), // Max 5 files
+  reportUpload.array('attachments', 5),
   check('title', 'Title is required').not().isEmpty(),
   check('title', 'Title must be less than 100 characters').isLength({ max: 100 }),
   check('content', 'Content is required').not().isEmpty(),
@@ -1647,7 +1487,6 @@ reportRouter.post('/', [
   try {
     const { title, content, category, priority, department, dueDate, tags } = req.body;
     
-    // Process attachments
     const attachments = req.files ? req.files.map(file => ({
       filename: file.filename,
       originalName: file.originalname,
@@ -1656,7 +1495,6 @@ reportRouter.post('/', [
       mimetype: file.mimetype
     })) : [];
     
-    // Create new report
     const newReport = new Report({
       employeeId: req.user.id,
       title,
@@ -1687,21 +1525,14 @@ reportRouter.post('/', [
   }
 });
 
-// @route   GET api/reports
-// @desc    Get all reports (filtered by role and query parameters)
-// @access  Private
 reportRouter.get('/', auth, async (req, res) => {
   try {
     const { page = 1, limit = 10, status, category, priority, department, sort = 'createdAt' } = req.query;
     
-    // Build query based on user role
     let query = {};
     
-    // CEO can see all reports
     if (req.user.role === 'ceo') {
-      // No filter needed
     } 
-    // Other executives see only reports in their category
     else if (['cto', 'cfo', 'coo'].includes(req.user.role)) {
       const categoryMap = {
         'cto': 'technical',
@@ -1710,31 +1541,25 @@ reportRouter.get('/', auth, async (req, res) => {
       };
       query.category = categoryMap[req.user.role];
     } 
-    // Employees can see only their own reports
     else if (req.user.role === 'employee') {
       query.employeeId = req.user.id;
     }
     
-    // Add filters from query parameters
     if (status) query.status = status;
     if (category) query.category = category;
     if (priority) query.priority = priority;
     if (department) query.department = department;
     
-    // Exclude archived reports by default
     query.isArchived = { $ne: true };
     
-    // Calculate pagination
     const skip = (page - 1) * limit;
     
-    // Execute query with pagination
     const reports = await Report.find(query)
       .populate('employeeId', ['name', 'email', 'department'])
       .sort({ [sort]: -1 })
       .limit(parseInt(limit))
       .skip(skip);
     
-    // Get total count for pagination
     const total = await Report.countDocuments(query);
     
     res.json({
@@ -1757,9 +1582,6 @@ reportRouter.get('/', auth, async (req, res) => {
   }
 });
 
-// @route   GET api/reports/:id
-// @desc    Get a report by ID
-// @access  Private
 reportRouter.get('/:id', auth, async (req, res) => {
   try {
     const report = await Report.findById(req.params.id)
@@ -1774,7 +1596,6 @@ reportRouter.get('/:id', auth, async (req, res) => {
       });
     }
     
-    // Check if user has permission to view this report
     const hasAccess = checkReportAccess(req.user, report);
     if (!hasAccess) {
       return res.status(403).json({
@@ -1798,9 +1619,6 @@ reportRouter.get('/:id', auth, async (req, res) => {
   }
 });
 
-// @route   PUT api/reports/:id
-// @desc    Update a report
-// @access  Private
 reportRouter.put('/:id', [
   auth,
   reportUpload.array('attachments', 5),
@@ -1830,7 +1648,6 @@ reportRouter.put('/:id', [
       });
     }
     
-    // Check if user has permission to update this report
     const hasAccess = checkReportAccess(req.user, report);
     if (!hasAccess) {
       return res.status(403).json({
@@ -1840,7 +1657,6 @@ reportRouter.put('/:id', [
       });
     }
     
-    // Only employees can update draft reports
     if (req.user.role === 'employee' && report.status !== 'draft') {
       return res.status(403).json({
         success: false,
@@ -1849,7 +1665,6 @@ reportRouter.put('/:id', [
       });
     }
     
-    // Update fields
     const { title, content, category, priority, department, dueDate, tags, status } = req.body;
     
     if (title) report.title = title;
@@ -1861,7 +1676,6 @@ reportRouter.put('/:id', [
     if (tags) report.tags = tags.split(',').map(tag => tag.trim());
     if (status) report.status = status;
     
-    // Handle new attachments
     if (req.files && req.files.length > 0) {
       const newAttachments = req.files.map(file => ({
         filename: file.filename,
@@ -1873,7 +1687,6 @@ reportRouter.put('/:id', [
       report.attachments = [...report.attachments, ...newAttachments];
     }
     
-    // Set last modified by
     report.lastModifiedBy = req.user.id;
     
     const updatedReport = await report.save();
@@ -1893,9 +1706,6 @@ reportRouter.put('/:id', [
   }
 });
 
-// @route   DELETE api/reports/:id
-// @desc    Delete a report
-// @access  Private
 reportRouter.delete('/:id', auth, async (req, res) => {
   try {
     const report = await Report.findById(req.params.id);
@@ -1908,7 +1718,6 @@ reportRouter.delete('/:id', auth, async (req, res) => {
       });
     }
     
-    // Check if user has permission to delete this report
     const hasAccess = checkReportAccess(req.user, report);
     if (!hasAccess) {
       return res.status(403).json({
@@ -1918,7 +1727,6 @@ reportRouter.delete('/:id', auth, async (req, res) => {
       });
     }
     
-    // Only employees can delete their own draft reports
     if (req.user.role === 'employee' && report.status !== 'draft') {
       return res.status(403).json({
         success: false,
@@ -1927,7 +1735,6 @@ reportRouter.delete('/:id', auth, async (req, res) => {
       });
     }
     
-    // Archive instead of deleting
     report.isArchived = true;
     report.lastModifiedBy = req.user.id;
     await report.save();
@@ -1946,9 +1753,6 @@ reportRouter.delete('/:id', auth, async (req, res) => {
   }
 });
 
-// @route   POST api/reports/:id/status
-// @desc    Update report status
-// @access  Private (Executives only)
 reportRouter.post('/:id/status', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo'),
@@ -1975,7 +1779,6 @@ reportRouter.post('/:id/status', [
       });
     }
     
-    // Check if user has permission to update this report
     const hasAccess = checkReportAccess(req.user, report);
     if (!hasAccess) {
       return res.status(403).json({
@@ -1987,7 +1790,6 @@ reportRouter.post('/:id/status', [
     
     const { status, reviewComments } = req.body;
     
-    // Update status and review info
     report.status = status;
     report.reviewedBy = req.user.id;
     if (reviewComments) report.reviewComments = reviewComments;
@@ -2010,9 +1812,6 @@ reportRouter.post('/:id/status', [
   }
 });
 
-// @route   GET api/reports/overdue
-// @desc    Get overdue reports
-// @access  Private (Executives only)
 reportRouter.get('/filter/overdue', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo')
@@ -2039,38 +1838,29 @@ reportRouter.get('/filter/overdue', [
 // Complaint Routes
 const complaintRouter = express.Router();
 
-// Helper function to check complaint access
 function checkComplaintAccess(user, complaint) {
-  // CEO can access all complaints
   if (user.role === 'ceo') {
     return true;
   }
   
-  // HR can access all complaints
   if (user.department === 'HR') {
     return true;
   }
   
-  // Employees can only access their own complaints
   if (user.role === 'employee') {
     return complaint.employeeId && complaint.employeeId._id.toString() === user.id;
   }
   
-  // Other executives can access complaints in their department
   if (['cto', 'cfo', 'coo'].includes(user.role)) {
     return complaint.employeeId && complaint.employeeId.department === user.department;
   }
   
-  // All other roles are denied
   return false;
 }
 
-// @route   POST api/complaints
-// @desc    Create a new complaint
-// @access  Private
 complaintRouter.post('/', [
   auth,
-  complaintUpload.array('attachments', 5), // Max 5 files
+  complaintUpload.array('attachments', 5),
   check('title', 'Title is required').not().isEmpty(),
   check('title', 'Title must be less than 100 characters').isLength({ max: 100 }),
   check('description', 'Description is required').not().isEmpty(),
@@ -2093,7 +1883,6 @@ complaintRouter.post('/', [
   try {
     const { title, description, category, priority, severity, isAnonymous, isConfidential } = req.body;
     
-    // Process attachments
     const attachments = req.files ? req.files.map(file => ({
       filename: file.filename,
       originalName: file.originalname,
@@ -2102,7 +1891,6 @@ complaintRouter.post('/', [
       mimetype: file.mimetype
     })) : [];
     
-    // Create new complaint
     const newComplaint = new Complaint({
       employeeId: isAnonymous ? null : req.user.id,
       title,
@@ -2111,7 +1899,7 @@ complaintRouter.post('/', [
       priority: priority || 'medium',
       severity: severity || 'moderate',
       isAnonymous: isAnonymous || false,
-      isConfidential: isConfidential !== false, // Default to true unless explicitly set to false
+      isConfidential: isConfidential !== false,
       attachments,
       lastUpdatedBy: req.user.id
     });
@@ -2133,39 +1921,28 @@ complaintRouter.post('/', [
   }
 });
 
-// @route   GET api/complaints
-// @desc    Get all complaints (filtered by role and query parameters)
-// @access  Private
 complaintRouter.get('/', auth, async (req, res) => {
   try {
     const { page = 1, limit = 10, status, category, priority, severity, sort = 'createdAt' } = req.query;
     
-    // Build query based on user role
     let query = {};
     
-    // CEO and HR can see all complaints
     if (req.user.role === 'ceo' || req.user.department === 'HR') {
-      // No filter needed
     } 
-    // Employees can see only their own complaints
     else if (req.user.role === 'employee') {
       query.employeeId = req.user.id;
     }
-    // Other executives see only complaints in their department
     else {
       query.department = req.user.department;
     }
     
-    // Add filters from query parameters
     if (status) query.status = status;
     if (category) query.category = category;
     if (priority) query.priority = priority;
     if (severity) query.severity = severity;
     
-    // Calculate pagination
     const skip = (page - 1) * limit;
     
-    // Execute query with pagination
     const complaints = await Complaint.find(query)
       .populate('employeeId', ['name', 'email', 'department'])
       .populate('assignedTo', ['name', 'email', 'department'])
@@ -2173,7 +1950,6 @@ complaintRouter.get('/', auth, async (req, res) => {
       .limit(parseInt(limit))
       .skip(skip);
     
-    // Get total count for pagination
     const total = await Complaint.countDocuments(query);
     
     res.json({
@@ -2196,9 +1972,6 @@ complaintRouter.get('/', auth, async (req, res) => {
   }
 });
 
-// @route   GET api/complaints/:id
-// @desc    Get a complaint by ID
-// @access  Private
 complaintRouter.get('/:id', auth, async (req, res) => {
   try {
     const complaint = await Complaint.findById(req.params.id)
@@ -2214,7 +1987,6 @@ complaintRouter.get('/:id', auth, async (req, res) => {
       });
     }
     
-    // Check if user has permission to view this complaint
     const hasAccess = checkComplaintAccess(req.user, complaint);
     if (!hasAccess) {
       return res.status(403).json({
@@ -2238,9 +2010,6 @@ complaintRouter.get('/:id', auth, async (req, res) => {
   }
 });
 
-// @route   PUT api/complaints/:id
-// @desc    Update a complaint
-// @access  Private
 complaintRouter.put('/:id', [
   auth,
   complaintUpload.array('attachments', 5),
@@ -2271,7 +2040,6 @@ complaintRouter.put('/:id', [
       });
     }
     
-    // Check if user has permission to update this complaint
     const hasAccess = checkComplaintAccess(req.user, complaint);
     if (!hasAccess) {
       return res.status(403).json({
@@ -2281,7 +2049,6 @@ complaintRouter.put('/:id', [
       });
     }
     
-    // Update fields
     const { title, description, category, priority, severity, status } = req.body;
     
     if (title) complaint.title = title;
@@ -2291,7 +2058,6 @@ complaintRouter.put('/:id', [
     if (severity) complaint.severity = severity;
     if (status) complaint.status = status;
     
-    // Handle new attachments
     if (req.files && req.files.length > 0) {
       const newAttachments = req.files.map(file => ({
         filename: file.filename,
@@ -2303,7 +2069,6 @@ complaintRouter.put('/:id', [
       complaint.attachments = [...complaint.attachments, ...newAttachments];
     }
     
-    // Set last modified by
     complaint.lastUpdatedBy = req.user.id;
     
     const updatedComplaint = await complaint.save();
@@ -2324,9 +2089,6 @@ complaintRouter.put('/:id', [
   }
 });
 
-// @route   POST api/complaints/:id/status
-// @desc    Update complaint status
-// @access  Private (HR and Executives only)
 complaintRouter.post('/:id/status', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo', 'employee'),
@@ -2353,7 +2115,6 @@ complaintRouter.post('/:id/status', [
       });
     }
     
-    // Check if user has permission to update this complaint
     const hasAccess = checkComplaintAccess(req.user, complaint);
     if (!hasAccess) {
       return res.status(403).json({
@@ -2365,10 +2126,8 @@ complaintRouter.post('/:id/status', [
     
     const { status, comments } = req.body;
     
-    // Update status using the model method
     await complaint.updateStatus(status, req.user.id, comments);
     
-    // Get updated complaint with populated fields
     const updatedComplaint = await Complaint.findById(complaint._id)
       .populate('employeeId', ['name', 'email', 'department'])
       .populate('assignedTo', ['name', 'email', 'department'])
@@ -2388,9 +2147,6 @@ complaintRouter.post('/:id/status', [
   }
 });
 
-// @route   GET api/complaints/high-priority
-// @desc    Get high-priority complaints
-// @access  Private (HR and Executives only)
 complaintRouter.get('/filter/high-priority', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo', 'employee')
@@ -2415,9 +2171,6 @@ complaintRouter.get('/filter/high-priority', [
   }
 });
 
-// @route   GET api/complaints/overdue
-// @desc    Get overdue complaints
-// @access  Private (HR and Executives only)
 complaintRouter.get('/filter/overdue', [
   auth,
   authorize('ceo', 'cto', 'cfo', 'coo', 'employee')
