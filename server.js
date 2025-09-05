@@ -21,11 +21,6 @@ dotenv.config();
 // Initialize Express app
 const app = express();
 
-// Security middleware
-app.use(helmet());
-app.use(xss());
-app.use(hpp());
-
 // Middleware
 const allowedOrigins = [
   'http://localhost:3000',
@@ -47,6 +42,9 @@ app.use(cors({
 
 app.use(express.json({ limit: '10kb' }));
 app.use(morgan('dev'));
+app.use(helmet());
+app.use(xss());
+app.use(hpp());
 
 // Rate limiting
 const authLimiter = rateLimit({
