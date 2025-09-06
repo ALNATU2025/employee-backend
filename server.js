@@ -1,4 +1,3 @@
-// server.js
 const express = require('express');
 const mongoose = require('mongoose');
 const dotenv = require('dotenv');
@@ -22,29 +21,27 @@ dotenv.config();
 const app = express();
 
 // Middleware
-const allowedOrigins = [
-  'http://localhost:3000',
-  process.env.FRONTEND_URL,
-  'https://employee-backend-mcg5.onrender.com'
-].filter(Boolean);
-
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error(`Origin ${origin} not allowed by CORS`));
-    }
-  },
-  credentials: true
-}));
-
 app.use(express.json({ limit: '10kb' }));
 app.use(morgan('dev'));
 app.use(helmet());
 app.use(xss());
 app.use(hpp());
+
+// Mobile-friendly CORS configuration
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-auth-token'],
+  credentials: false
+}));
+
+// Security headers for mobile apps
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  next();
+});
 
 // Rate limiting
 const authLimiter = rateLimit({
@@ -116,6 +113,15 @@ const connectDB = async () => {
     setTimeout(connectDB, 5000);
   }
 };
+
+// Validate required environment variables
+const requiredEnvVars = ['MONGO_URI', 'JWT_SECRET'];
+requiredEnvVars.forEach(varName => {
+  if (!process.env[varName]) {
+    console.error(`Missing required environment variable: ${varName}`);
+    process.exit(1);
+  }
+});
 
 connectDB();
 
@@ -638,15 +644,13 @@ const Complaint = mongoose.model('Complaint', ComplaintSchema);
 const auth = async function (req, res, next) {
   let token;
   
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    token = authHeader.split(' ')[1];
+  // Check Authorization header first (most common for mobile apps)
+  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+    token = req.headers.authorization.split(' ')[1];
   }
-  else if (req.header('x-auth-token')) {
-    token = req.header('x-auth-token');
-  }
-  else if (req.cookies && req.cookies.token) {
-    token = req.cookies.token;
+  // Fallback to x-auth-token header
+  else if (req.headers['x-auth-token']) {
+    token = req.headers['x-auth-token'];
   }
   
   if (!token) {
@@ -682,7 +686,7 @@ const auth = async function (req, res, next) {
     console.error('Authentication error:', {
       error: err.message,
       stack: err.stack,
-      token: token.substring(0, 10) + '...'
+      token: token ? token.substring(0, 10) + '...' : 'No token'
     });
     
     let errorMessage = 'Token is not valid';
@@ -984,20 +988,18 @@ authRouter.post('/forgot-password', [
     if (!user) {
       return res.json({
         success: true,
-        message: 'If an account with that email exists, a reset link has been sent'
+        message: 'If an account with that email exists, a reset token has been generated'
       });
     }
     
     const resetToken = user.getResetPasswordToken();
     await user.save({ validateBeforeSave: false });
     
-    const resetUrl = `${process.env.FRONTEND_URL}/reset-password/${resetToken}`;
-    
-    console.log('Reset URL:', resetUrl);
-    
+    // For mobile apps, return the token directly
     res.json({
       success: true,
-      message: 'Password reset email sent'
+      message: 'Password reset token generated',
+      resetToken: resetToken
     });
   } catch (err) {
     console.error('Forgot password error:', err.message);
